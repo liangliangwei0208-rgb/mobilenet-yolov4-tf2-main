@@ -11,7 +11,7 @@
 - `nets/`、`utils/`、`utils_coco/`：网络结构与工具函数。
 - `model_data/`：类别、anchor、字体和示例权重文件。
 - `img/`：测试图片。
-- `VOCdevkit/`：VOC 数据集目录结构示例。
+- `VOCdevkit/`：VOC 数据集目录占位，保留目录名和说明文件；实际标注、图片和划分文件不提交到 GitHub。
 
 ## 运行环境
 
@@ -132,6 +132,8 @@ VOCdevkit/
     ImageSets/
       Main/
 ```
+
+为避免仓库过大，`VOCdevkit/VOC2007` 下只提交 `Annotations`、`JPEGImages`、`ImageSets/Main` 三个目录中的 `README.md` 占位说明；实际数据文件保留在本地，不提交到 GitHub。
 
 训练前需要：
 

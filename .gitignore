@@ -6,6 +6,14 @@ Medical_Datasets/
 lfw/
 .temp_map_out/
 
+# Keep VOC directory placeholders, but do not commit local dataset contents.
+VOCdevkit/VOC2007/Annotations/*
+!VOCdevkit/VOC2007/Annotations/README.md
+VOCdevkit/VOC2007/JPEGImages/*
+!VOCdevkit/VOC2007/JPEGImages/README.md
+VOCdevkit/VOC2007/ImageSets/Main/*
+!VOCdevkit/VOC2007/ImageSets/Main/README.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
