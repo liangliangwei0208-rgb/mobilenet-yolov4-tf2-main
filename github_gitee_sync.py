@@ -805,6 +805,74 @@ def update_gitee_repo_visibility(
         )
 
 
+def gitee_default_branch(response: ApiResponse) -> str | None:
+    if not isinstance(response.data, dict):
+        return None
+    value = response.data.get("default_branch")
+    if not value:
+        return None
+    return str(value)
+
+
+def update_gitee_default_branch(
+    target: GiteeTarget,
+    *,
+    token: str,
+    branch: str,
+) -> None:
+    # Gitee 网页默认展示 default_branch；同步 main 后也要把默认分支切到 main。
+    response = gitee_api_request(
+        "PATCH",
+        f"/repos/{api_quote(target.owner)}/{api_quote(target.name)}",
+        token=token,
+        form={
+            "name": target.name,
+            "default_branch": branch,
+        },
+    )
+    if response.status not in (200, 201, 204):
+        raise SyncError(
+            f"Could not update Gitee default branch {target.web_url}: "
+            f"HTTP {response.status}: {gitee_error_message(response)}"
+        )
+
+
+def ensure_gitee_default_branch(
+    *,
+    target: GiteeTarget,
+    branch: str,
+    token: str | None,
+    dry_run: bool,
+) -> None:
+    if dry_run:
+        step(f"Would ensure Gitee default branch is {branch}: {target.web_url}")
+        return
+
+    if not token:
+        log(
+            f"[WARN] {GITEE_TOKEN_ENV} is not set; code was pushed to {branch}, "
+            f"but Gitee may still open another default branch in the web UI. "
+            f"Set the default branch to {branch} on Gitee manually, or set "
+            f"{GITEE_TOKEN_ENV} and re-run this script."
+        )
+        return
+
+    response = get_gitee_repo(target, token)
+    if response.status != 200:
+        raise SyncError(
+            f"Could not read Gitee repository default branch {target.web_url}: "
+            f"HTTP {response.status}: {gitee_error_message(response)}"
+        )
+
+    current = gitee_default_branch(response)
+    if current == branch:
+        log(f"Gitee default branch is already {branch}")
+        return
+
+    step(f"Set Gitee default branch to {branch}: {target.web_url}")
+    update_gitee_default_branch(target, token=token, branch=branch)
+
+
 def create_gitee_repo(target: GiteeTarget, *, token: str, private: bool) -> None:
     # Gitee API 的 private=false 表示创建公开仓库；脚本默认 private=False。
     response = gitee_api_request(
@@ -1015,6 +1083,13 @@ def sync_repositories(
         result = run_git(repo, ["fetch", remote, branch], check=False)
         if result.returncode != 0:
             fetch_warnings.append(f"refresh {remote}: exit code {result.returncode}")
+
+    ensure_gitee_default_branch(
+        target=target,
+        branch=branch,
+        token=token,
+        dry_run=dry_run,
+    )
 
     print_final_refs(repo, branch, github_remote, gitee_remote)
     for missing_ref in missing_refs:

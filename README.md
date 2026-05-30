@@ -95,6 +95,8 @@ ssh://git@ssh.github.com:443/liangliangwei0208-rgb/mobilenet-yolov4-tf2-main.git
 
 `github_gitee_sync.py` 的 GitHub owner 默认使用 `liangliangwei0208-rgb`，GitHub 仓库名默认使用当前文件夹名。脚本默认创建或同步公开仓库；如果发现 Gitee 同名仓库已经存在但为私有，会在 `GITEE_ACCESS_TOKEN` 可用时尝试自动改为公开。
 
+Gitee 新建仓库时可能默认打开 `master` 分支，而本项目同步分支是 `main`。脚本会在 `GITEE_ACCESS_TOKEN` 可用时尝试把 Gitee 默认分支改为 `main`；如果没有 token，需要在 Gitee 网页的仓库管理中手动把默认分支切换为 `main`。
+
 ## 快速预测
 
 1. 激活环境并进入项目根目录。
