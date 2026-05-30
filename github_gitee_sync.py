@@ -49,6 +49,7 @@ from typing import Any, Sequence
 DEFAULT_BRANCH = "main"
 DEFAULT_GITHUB_REMOTE = "origin"
 DEFAULT_GITEE_REMOTE = "gitee"
+DEFAULT_GITHUB_OWNER = "liangliangwei0208-rgb"
 GITHUB_API_BASE = "https://api.github.com"
 GITHUB_TOKEN_ENV_NAMES = ("GITHUB_TOKEN", "GH_TOKEN")
 GITEE_API_BASE = "https://gitee.com/api/v5"
@@ -556,15 +557,21 @@ def choose_github_target(
     github_private: bool,
     dry_run: bool,
 ) -> tuple[GitHubTarget, bool]:
-    default_owner: str | None = None
+    default_owner: str | None = DEFAULT_GITHUB_OWNER
     if token and not dry_run:
         try:
-            default_owner = github_authenticated_login(token)
+            token_owner = github_authenticated_login(token)
+            if not github_owner and token_owner != DEFAULT_GITHUB_OWNER:
+                log(
+                    f"[WARN] GitHub token login is {token_owner}, "
+                    f"but the default owner is {DEFAULT_GITHUB_OWNER}."
+                )
         except SyncError as exc:
             log(f"[WARN] {exc}")
 
-    owner = github_owner
-    name = github_repo or repo.name
+    owner = github_owner or default_owner
+    repo_default_name = repo.name or repo.resolve().name
+    name = github_repo or repo_default_name
     private = github_private
 
     has_complete_cli_target = bool(owner and name)
@@ -577,8 +584,7 @@ def choose_github_target(
             private = prompt_yes_no("Create GitHub repository as private?", False)
     elif not owner:
         raise SyncError(
-            "Missing GitHub remote. In non-interactive mode, pass --github-owner "
-            "and optionally --github-repo, or run in an interactive terminal."
+            "Missing GitHub owner. Pass --github-owner and optionally --github-repo."
         )
 
     return build_github_target(owner, name), private
@@ -751,6 +757,13 @@ def gitee_repo_exists(target: GiteeTarget, token: str | None) -> bool:
     )
 
 
+def is_gitee_repo_private(response: ApiResponse) -> bool:
+    if not isinstance(response.data, dict):
+        return False
+    private_value = response.data.get("private")
+    return private_value is True or str(private_value).lower() == "true"
+
+
 def ensure_gitee_repo_visibility(
     target: GiteeTarget,
     response: ApiResponse,
@@ -758,16 +771,37 @@ def ensure_gitee_repo_visibility(
     private: bool,
 ) -> None:
     # 默认要求 Gitee 仓库公开。只有用户显式加 --private 时，才允许私有仓库。
-    if private or not isinstance(response.data, dict):
+    if private:
         return
 
-    private_value = response.data.get("private")
-    is_private = private_value is True or str(private_value).lower() == "true"
-    if is_private:
+    if is_gitee_repo_private(response):
         raise SyncError(
             f"Gitee repository already exists but is private: {target.web_url}. "
             "Make it public on Gitee, or re-run with --private if you really want "
             "a private mirror."
+        )
+
+
+def update_gitee_repo_visibility(
+    target: GiteeTarget,
+    *,
+    token: str,
+    private: bool,
+) -> None:
+    # Gitee 使用 PATCH 仓库接口更新公开/私有状态，private=false 表示公开仓库。
+    response = gitee_api_request(
+        "PATCH",
+        f"/repos/{api_quote(target.owner)}/{api_quote(target.name)}",
+        token=token,
+        form={
+            "name": target.name,
+            "private": str(private).lower(),
+        },
+    )
+    if response.status not in (200, 201, 204):
+        raise SyncError(
+            f"Could not update Gitee repository visibility {target.web_url}: "
+            f"HTTP {response.status}: {gitee_error_message(response)}"
         )
 
 
@@ -808,6 +842,16 @@ def ensure_gitee_repo(
     step(f"Check Gitee repository: {target.web_url}")
     response = get_gitee_repo(target, token)
     if response.status == 200:
+        if not private and is_gitee_repo_private(response):
+            if not token:
+                raise SyncError(
+                    f"Gitee repository already exists but is private: {target.web_url}. "
+                    f"Set {GITEE_TOKEN_ENV} so the script can make it public, "
+                    "or make it public on Gitee manually."
+                )
+            step(f"Make existing Gitee repository public: {target.web_url}")
+            update_gitee_repo_visibility(target, token=token, private=False)
+            response = get_gitee_repo(target, token)
         ensure_gitee_repo_visibility(target, response, private=private)
         log(f"Gitee repository exists: {target.web_url}")
         return
@@ -1060,7 +1104,7 @@ def print_init_gitee(
             )
         else:
             slug = RepoSlug(
-                owner="<github-owner>",
+                owner=DEFAULT_GITHUB_OWNER,
                 name=github_repo or repo.name,
             )
         if slug:
@@ -1099,13 +1143,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--github-owner",
-        default=None,
-        help="GitHub user or organization to create when the GitHub remote is missing.",
+        default=DEFAULT_GITHUB_OWNER,
+        help=f"GitHub user or organization. Defaults to {DEFAULT_GITHUB_OWNER}.",
     )
     parser.add_argument(
         "--github-repo",
         default=None,
-        help="GitHub repository name to create. Defaults to the local directory name.",
+        help="GitHub repository name. Defaults to the local directory name.",
     )
     parser.add_argument(
         "--github-private",

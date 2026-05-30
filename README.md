@@ -91,6 +91,10 @@ ssh://git@ssh.github.com:443/liangliangwei0208-rgb/mobilenet-yolov4-tf2-main.git
 
 这是 GitHub 支持的 SSH-over-443 写法。`github_gitee_sync.py` 已支持识别该地址，不需要改回普通的 `git@github.com:owner/repo.git`。
 
+### 4. 调整 GitHub/Gitee 同步脚本默认行为
+
+`github_gitee_sync.py` 的 GitHub owner 默认使用 `liangliangwei0208-rgb`，GitHub 仓库名默认使用当前文件夹名。脚本默认创建或同步公开仓库；如果发现 Gitee 同名仓库已经存在但为私有，会在 `GITEE_ACCESS_TOKEN` 可用时尝试自动改为公开。
+
 ## 快速预测
 
 1. 激活环境并进入项目根目录。
