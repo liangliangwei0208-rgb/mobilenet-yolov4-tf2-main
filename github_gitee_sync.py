@@ -244,12 +244,31 @@ def parse_remote_slug(remote_url: str, expected_host: str) -> RepoSlug | None:
     return RepoSlug(owner=parts[0], name=strip_dot_git(parts[1]))
 
 
-def parse_github_remote(remote_url: str) -> RepoSlug:
+def parse_github_slug(remote_url: str) -> RepoSlug | None:
+    # GitHub 在部分网络环境下需要走 443 端口，地址会变成 ssh.github.com。
     slug = parse_remote_slug(remote_url, "github.com")
+    if slug is not None:
+        return slug
+
+    parsed = urllib.parse.urlparse(remote_url)
+    if parsed.scheme != "ssh" or parsed.hostname != "ssh.github.com":
+        return None
+    if parsed.port not in (None, 443):
+        return None
+
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(parts) != 2:
+        return None
+    return RepoSlug(owner=parts[0], name=strip_dot_git(parts[1]))
+
+
+def parse_github_remote(remote_url: str) -> RepoSlug:
+    slug = parse_github_slug(remote_url)
     if slug is None:
         raise SyncError(
             "GitHub remote must look like "
-            "git@github.com:owner/repo.git or https://github.com/owner/repo.git"
+            "git@github.com:owner/repo.git, https://github.com/owner/repo.git, "
+            "or ssh://git@ssh.github.com:443/owner/repo.git"
         )
     return slug
 
@@ -577,7 +596,7 @@ def ensure_github_remote(
 ) -> RepoSlug:
     existing_url = get_remote_url(repo, remote)
     if existing_url:
-        slug = parse_remote_slug(existing_url, "github.com")
+        slug = parse_github_slug(existing_url)
         if slug is not None:
             log(f"GitHub remote {remote} points to {existing_url}")
             return slug
@@ -1114,7 +1133,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--fix-remote",
         action="store_true",
-        help="Update an existing mismatched Gitee remote URL.",
+        help="Update an existing mismatched GitHub or Gitee remote URL.",
     )
     parser.add_argument(
         "--dry-run",

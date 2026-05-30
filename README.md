@@ -12,6 +12,7 @@
 - `model_data/`：类别、anchor、字体和示例权重文件。
 - `img/`：测试图片。
 - `VOCdevkit/`：VOC 数据集目录占位，保留目录名和说明文件；实际标注、图片和划分文件不提交到 GitHub。
+- `github_gitee_sync.py`：本地、GitHub 和 Gitee 同步辅助脚本。
 
 ## 运行环境
 
@@ -79,6 +80,16 @@ img/street.jpg
 ```
 
 不要只输入 `street.jpg`，否则脚本会在当前工作目录下查找图片，导致打开失败。
+
+### 3. 修复 GitHub 443 端口 SSH 地址识别
+
+当前项目的 GitHub 远程地址使用：
+
+```text
+ssh://git@ssh.github.com:443/liangliangwei0208-rgb/mobilenet-yolov4-tf2-main.git
+```
+
+这是 GitHub 支持的 SSH-over-443 写法。`github_gitee_sync.py` 已支持识别该地址，不需要改回普通的 `git@github.com:owner/repo.git`。
 
 ## 快速预测
 
