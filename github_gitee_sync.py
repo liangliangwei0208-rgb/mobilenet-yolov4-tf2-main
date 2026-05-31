@@ -2,8 +2,9 @@
 GitHub/Gitee 三方同步脚本。
 
 使用方式：把这个文件放在本地 Git 仓库根目录运行。脚本会读取 GitHub
-远程仓库，推导对应的 Gitee 仓库，必要时创建远程仓库，然后把本地、
-GitHub、Gitee 三端同步到同一个分支提交。
+远程仓库，推导对应的 Gitee 仓库，必要时创建远程仓库。直接运行会
+显示菜单，可选择只创建/补齐 GitHub 公开仓库，或把本地、GitHub、
+Gitee 三端同步到同一个分支提交。
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 
 def prepend_conda_dll_paths() -> None:
@@ -46,10 +48,14 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-DEFAULT_BRANCH = "main"
+DEFAULT_BRANCH = None
 DEFAULT_GITHUB_REMOTE = "origin"
 DEFAULT_GITEE_REMOTE = "gitee"
 DEFAULT_GITHUB_OWNER = "liangliangwei0208-rgb"
+DEFAULT_GITEE_OWNER = "liangliang2000"
+MODE_ENSURE_GITHUB = "ensure-github"
+MODE_SYNC = "sync"
+MODE_EXIT = "exit"
 GITHUB_API_BASE = "https://api.github.com"
 GITHUB_TOKEN_ENV_NAMES = ("GITHUB_TOKEN", "GH_TOKEN")
 GITEE_API_BASE = "https://gitee.com/api/v5"
@@ -86,6 +92,7 @@ class GiteeTarget:
     owner: str
     name: str
     ssh_url: str
+    https_url: str
     web_url: str
 
 
@@ -170,10 +177,22 @@ def ensure_repo(repo: Path) -> Path:
     return repo
 
 
+def local_folder_repo_name(repo: Path) -> str:
+    # GitHub 自动建库时，默认严格使用当前文件夹名，避免误用远端历史名称。
+    return repo.resolve().name
+
+
 def ensure_current_branch(repo: Path, branch: str) -> None:
     current = git_output(repo, ["branch", "--show-current"])
     if current != branch:
         raise SyncError(f"Current branch is {current!r}; expected {branch!r}.")
+
+
+def current_branch(repo: Path) -> str:
+    branch = git_output(repo, ["branch", "--show-current"])
+    if not branch:
+        raise SyncError("Could not detect current branch. Check whether HEAD is detached.")
+    return branch
 
 
 def ensure_clean_worktree(repo: Path) -> None:
@@ -198,6 +217,74 @@ def ensure_has_commit(repo: Path) -> None:
     if result.returncode != 0:
         raise SyncError(
             "This repository has no commits yet. Create an initial commit before syncing."
+        )
+
+
+def is_shallow_repository(repo: Path) -> bool:
+    return git_output(repo, ["rev-parse", "--is-shallow-repository"]) == "true"
+
+
+def git_dir(repo: Path) -> Path:
+    path = Path(git_output(repo, ["rev-parse", "--git-dir"]))
+    if not path.is_absolute():
+        path = repo / path
+    return path.resolve()
+
+
+def is_commit_reachable_from_refs(repo: Path, commit: str) -> bool:
+    result = subprocess.run(
+        ["git", "name-rev", "--name-only", "--no-undefined", commit],
+        cwd=str(repo),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def prune_stale_shallow_markers(repo: Path, *, dry_run: bool) -> None:
+    shallow_file = git_dir(repo) / "shallow"
+    if not shallow_file.exists():
+        return
+
+    markers = [
+        line.strip()
+        for line in shallow_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        if line.strip()
+    ]
+    stale_markers = [
+        marker for marker in markers if not is_commit_reachable_from_refs(repo, marker)
+    ]
+    if not stale_markers:
+        return
+
+    stale_marker_set = set(stale_markers)
+    kept_markers = [marker for marker in markers if marker not in stale_marker_set]
+    if kept_markers:
+        step(f"Remove stale shallow marker entries: {len(stale_markers)}")
+        if not dry_run:
+            shallow_file.write_text("\n".join(kept_markers) + "\n", encoding="utf-8")
+        return
+
+    step("Remove stale shallow marker file")
+    if not dry_run:
+        shallow_file.unlink()
+
+
+def ensure_complete_history(repo: Path, remote: str, *, dry_run: bool) -> None:
+    prune_stale_shallow_markers(repo, dry_run=dry_run)
+    if not is_shallow_repository(repo):
+        return
+
+    step(f"Complete shallow Git history from {remote}")
+    run_git(repo, ["fetch", "--unshallow", remote], dry_run=dry_run)
+    prune_stale_shallow_markers(repo, dry_run=dry_run)
+    if not dry_run and is_shallow_repository(repo):
+        raise SyncError(
+            "Repository is still shallow after fetching full history. "
+            "Check .git/shallow before pushing to mirrors."
         )
 
 
@@ -299,15 +386,62 @@ def build_gitee_target(owner: str, repo_name: str) -> GiteeTarget:
         owner=owner,
         name=repo_name,
         ssh_url=f"git@gitee.com:{owner}/{repo_name}.git",
+        https_url=f"https://gitee.com/{owner}/{repo_name}.git",
         web_url=f"https://gitee.com/{owner}/{repo_name}",
     )
 
 
 def remote_matches_target(existing_url: str, target: GiteeTarget) -> bool:
-    if existing_url.strip() == target.ssh_url:
+    existing = existing_url.strip()
+    if existing in {target.ssh_url, target.https_url}:
         return True
     slug = parse_remote_slug(existing_url, "gitee.com")
     return slug == RepoSlug(owner=target.owner, name=target.name)
+
+
+def gitee_ssh_remote_usable(repo: Path, target: GiteeTarget) -> bool:
+    """Return True only when the Gitee SSH remote can be accessed non-interactively."""
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=15"
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", target.ssh_url],
+            cwd=str(repo),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            timeout=30,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"[WARN] Gitee SSH probe failed; will use HTTPS: {exc}")
+        return False
+
+    if result.returncode == 0:
+        log(f"Gitee SSH remote is usable: {target.ssh_url}")
+        return True
+
+    output = strip_ansi(f"{result.stdout}\n{result.stderr}").strip()
+    if output:
+        first_line = output.splitlines()[0]
+        log(f"[WARN] Gitee SSH remote is not usable; will use HTTPS. Reason: {first_line}")
+    else:
+        log("[WARN] Gitee SSH remote is not usable; will use HTTPS.")
+    return False
+
+
+def choose_gitee_git_url(repo: Path, target: GiteeTarget, *, dry_run: bool) -> str:
+    """Prefer SSH for Gitee; fall back to HTTPS when SSH auth/host verification is unavailable."""
+    if dry_run:
+        log(f"Dry run: prefer Gitee SSH remote, fallback HTTPS if needed: {target.ssh_url}")
+        return target.ssh_url
+    if gitee_ssh_remote_usable(repo, target):
+        return target.ssh_url
+    log(f"Using Gitee HTTPS remote: {target.https_url}")
+    return target.https_url
 
 
 def strip_ansi(text: str) -> str:
@@ -347,8 +481,12 @@ def detect_gitee_ssh_owner() -> str | None:
         return None
 
 
-def choose_gitee_owner(explicit_owner: str | None, fallback_owner: str) -> str:
-    """优先使用命令行参数，其次使用 SSH 账号，最后回退 GitHub owner。"""
+def choose_gitee_owner(
+    explicit_owner: str | None,
+    fallback_owner: str,
+    token: str | None = None,
+) -> str:
+    """优先使用命令行参数，其次使用 SSH 账号，再用 Gitee token，最后使用默认 Gitee owner。"""
     if explicit_owner:
         return explicit_owner
 
@@ -357,7 +495,17 @@ def choose_gitee_owner(explicit_owner: str | None, fallback_owner: str) -> str:
         log(f"Detected Gitee SSH owner: {detected_owner}")
         return detected_owner
 
-    log(f"[WARN] Could not detect Gitee SSH owner; fallback to {fallback_owner}")
+    if token:
+        token_owner = gitee_authenticated_login(token)
+        if token_owner:
+            log(f"Detected Gitee owner from token: {token_owner}")
+            return token_owner
+
+    if DEFAULT_GITEE_OWNER:
+        log(f"[WARN] Could not detect Gitee owner; fallback to {DEFAULT_GITEE_OWNER}")
+        return DEFAULT_GITEE_OWNER
+
+    log(f"[WARN] Could not detect Gitee owner; fallback to {fallback_owner}")
     return fallback_owner
 
 
@@ -367,6 +515,85 @@ def env_token(names: Sequence[str]) -> tuple[str | None, str]:
         if token:
             return token, name
     return None, names[0]
+
+
+def github_cli_token() -> tuple[str | None, str | None]:
+    # 如果用户已经用 gh 登录，就复用 gh 保存的 token；捕获输出，避免泄露 token。
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            timeout=15,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None, None
+
+    token = (result.stdout or "").strip()
+    if result.returncode == 0 and token:
+        return token, "gh auth token"
+    return None, None
+
+
+def github_token() -> tuple[str | None, str]:
+    token, source = env_token(GITHUB_TOKEN_ENV_NAMES)
+    if token:
+        return token, source
+
+    token, source = github_cli_token()
+    if token and source:
+        log(f"Using GitHub token from {source}.")
+        return token, source
+
+    return None, GITHUB_TOKEN_ENV_NAMES[0]
+
+
+def read_windows_user_env(name: str) -> str | None:
+    """读取 Windows 用户级环境变量，解决当前 PowerShell 未刷新环境变量的问题。"""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            value, _ = winreg.QueryValueEx(key, name)
+    except Exception:
+        return None
+
+    value = str(value).strip()
+    return value or None
+
+
+def gitee_token() -> tuple[str | None, str]:
+    """优先读取当前进程环境变量，其次读取 Windows 用户级环境变量。"""
+    token = os.environ.get(GITEE_TOKEN_ENV)
+    if token and token.strip():
+        return token.strip(), GITEE_TOKEN_ENV
+
+    token = read_windows_user_env(GITEE_TOKEN_ENV)
+    if token and token.strip():
+        return token.strip(), f"Windows User env {GITEE_TOKEN_ENV}"
+
+    return None, GITEE_TOKEN_ENV
+
+
+def gitee_authenticated_login(token: str) -> str | None:
+    """用 Gitee token 读取当前 Gitee 账号命名空间；失败时返回 None。"""
+    response = gitee_api_request("GET", "/user", token=token)
+    if response.status != 200 or not isinstance(response.data, dict):
+        return None
+
+    for key in ("login", "path", "username", "name"):
+        value = response.data.get(key)
+        if value:
+            try:
+                return validate_slug_part(str(value), "Gitee token owner")
+            except SyncError:
+                continue
+    return None
 
 
 def ensure_https_support() -> None:
@@ -419,6 +646,22 @@ def prompt_yes_no(label: str, default: bool = False) -> bool:
         print("Please answer y or n.")
 
 
+def urlopen_json_request(service: str, request: urllib.request.Request) -> ApiResponse:
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return read_json_response(response)
+        except urllib.error.HTTPError as exc:
+            return read_json_response(exc)
+        except urllib.error.URLError as exc:
+            if attempt >= 3:
+                raise SyncError(f"{service} API request failed: {exc}") from exc
+            log(f"[WARN] {service} API request failed once; retrying ({attempt}/3): {exc}")
+            time.sleep(attempt)
+
+    raise SyncError(f"{service} API request failed.")
+
+
 def github_api_request(
     method: str,
     path: str,
@@ -446,13 +689,7 @@ def github_api_request(
         headers=headers,
         method=method,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return read_json_response(response)
-    except urllib.error.HTTPError as exc:
-        return read_json_response(exc)
-    except urllib.error.URLError as exc:
-        raise SyncError(f"GitHub API request failed: {exc}") from exc
+    return urlopen_json_request("GitHub", request)
 
 
 def github_error_message(response: ApiResponse) -> str:
@@ -477,6 +714,24 @@ def github_authenticated_login(token: str) -> str:
 
 
 def github_repo_exists(target: GitHubTarget, token: str | None) -> bool:
+    # 先用 Git 协议检查。公开仓库即使没有 GitHub token，也应能被 ls-remote 看到。
+    for remote_url in (
+        f"https://github.com/{target.owner}/{target.name}.git",
+        target.ssh_url,
+    ):
+        result = subprocess.run(
+            ["git", "ls-remote", "--heads", remote_url],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            return True
+
+    # Git 检查失败后，再走 GitHub API。
     response = github_api_request(
         "GET",
         f"/repos/{api_quote(target.owner)}/{api_quote(target.name)}",
@@ -534,8 +789,9 @@ def ensure_github_repo(
 
     if not token:
         raise SyncError(
-            f"GitHub repository does not exist: {target.web_url}. "
-            "Set GITHUB_TOKEN or GH_TOKEN before running so the script can create it."
+            f"GitHub 仓库不存在：{target.web_url}。"
+            "请先设置 GITHUB_TOKEN/GH_TOKEN，或执行 gh auth login，"
+            "脚本才能自动创建公开仓库。"
         )
 
     step(f"Create {visibility} GitHub repository: {target.web_url}")
@@ -570,7 +826,7 @@ def choose_github_target(
             log(f"[WARN] {exc}")
 
     owner = github_owner or default_owner
-    repo_default_name = repo.name or repo.resolve().name
+    repo_default_name = local_folder_repo_name(repo)
     name = github_repo or repo_default_name
     private = github_private
 
@@ -590,6 +846,87 @@ def choose_github_target(
     return build_github_target(owner, name), private
 
 
+def ensure_existing_github_repository(
+    *,
+    repo: Path,
+    remote: str,
+    target: GitHubTarget,
+    token: str | None,
+    github_owner: str | None,
+    github_repo: str | None,
+    private: bool,
+    fix_remote: bool,
+    confirm_remote_retarget: bool,
+    dry_run: bool,
+) -> RepoSlug:
+    folder_name = local_folder_repo_name(repo)
+    visibility = "private" if private else "public"
+
+    step(f"Check GitHub repository: {target.web_url}")
+    if github_repo_exists(target, token):
+        log(f"GitHub repository already configured: {target.web_url}")
+        return RepoSlug(owner=target.owner, name=target.name)
+
+    replacement = build_github_target(
+        github_owner or target.owner,
+        github_repo or folder_name,
+    )
+    if replacement.owner == target.owner and replacement.name == target.name:
+        step(f"Create missing {visibility} GitHub repository: {target.web_url}")
+        ensure_github_repo(target=target, token=token, private=private, dry_run=dry_run)
+        return RepoSlug(owner=target.owner, name=target.name)
+
+    message = (
+        f"GitHub remote {remote!r} still points to {target.web_url}, "
+        "but that repository was not found. 远程仓库可能已经删除，"
+        f"但本地 {remote!r} 仍保留旧地址。"
+    )
+    if dry_run:
+        log(f"[WARN] {message}")
+        ensure_github_repo(
+            target=replacement,
+            token=token,
+            private=private,
+            dry_run=True,
+        )
+        step(f"Would update GitHub remote {remote}: {replacement.ssh_url}")
+        return RepoSlug(owner=replacement.owner, name=replacement.name)
+
+    if not fix_remote:
+        if confirm_remote_retarget:
+            print("\n检测到本地 GitHub 远端指向的仓库已经不存在：")
+            print(f"  当前 {remote}: {target.web_url}")
+            print(f"  新目标: {replacement.web_url}")
+            confirmed = prompt_yes_no(
+                "是否改为当前文件夹名对应的 GitHub 仓库？",
+                False,
+            )
+            if not confirmed:
+                raise SyncError("用户取消修改 GitHub remote。")
+        else:
+            raise SyncError(
+                f"{message} 如需改成当前文件夹名仓库，请在菜单中选择功能 1 并确认，"
+                "或在非交互运行时追加 --fix-remote。"
+            )
+
+    if replacement.name != folder_name and not github_repo:
+        raise SyncError(
+            f"Internal target mismatch: expected folder repository {folder_name!r}, "
+            f"got {replacement.name!r}."
+        )
+
+    step(f"Create or check {visibility} GitHub repository: {replacement.web_url}")
+    ensure_github_repo(
+        target=replacement,
+        token=token,
+        private=private,
+        dry_run=dry_run,
+    )
+    step(f"Update GitHub remote {remote}: {replacement.ssh_url}")
+    run_git(repo, ["remote", "set-url", remote, replacement.ssh_url], dry_run=dry_run)
+    return RepoSlug(owner=replacement.owner, name=replacement.name)
+
+
 def ensure_github_remote(
     *,
     repo: Path,
@@ -598,18 +935,31 @@ def ensure_github_remote(
     github_repo: str | None,
     github_private: bool,
     fix_remote: bool,
+    confirm_remote_retarget: bool,
     dry_run: bool,
 ) -> RepoSlug:
+    token = github_token()[0]
     existing_url = get_remote_url(repo, remote)
     if existing_url:
         slug = parse_github_slug(existing_url)
         if slug is not None:
             log(f"GitHub remote {remote} points to {existing_url}")
-            return slug
+            return ensure_existing_github_repository(
+                repo=repo,
+                remote=remote,
+                target=build_github_target(slug.owner, slug.name),
+                token=token,
+                github_owner=github_owner,
+                github_repo=github_repo,
+                private=github_private,
+                fix_remote=fix_remote,
+                confirm_remote_retarget=confirm_remote_retarget,
+                dry_run=dry_run,
+            )
 
         target, private = choose_github_target(
             repo=repo,
-            token=env_token(GITHUB_TOKEN_ENV_NAMES)[0],
+            token=token,
             github_owner=github_owner,
             github_repo=github_repo,
             github_private=github_private,
@@ -621,13 +971,11 @@ def ensure_github_remote(
         )
         if not fix_remote:
             raise SyncError(message + " Re-run with --fix-remote to update it.")
-        token = env_token(GITHUB_TOKEN_ENV_NAMES)[0]
         ensure_github_repo(target=target, token=token, private=private, dry_run=dry_run)
         step(f"Update GitHub remote {remote}: {target.ssh_url}")
         run_git(repo, ["remote", "set-url", remote, target.ssh_url], dry_run=dry_run)
         return RepoSlug(owner=target.owner, name=target.name)
 
-    token = env_token(GITHUB_TOKEN_ENV_NAMES)[0]
     target, private = choose_github_target(
         repo=repo,
         token=token,
@@ -648,27 +996,78 @@ def ensure_gitee_remote(
     remote: str,
     target: GiteeTarget,
     fix_remote: bool,
+    auto_fix_remote: bool,
     dry_run: bool,
 ) -> None:
+    preferred_url = choose_gitee_git_url(repo, target, dry_run=dry_run)
     existing_url = get_remote_url(repo, remote)
     if existing_url is None:
-        step(f"Add Gitee remote {remote}: {target.ssh_url}")
-        run_git(repo, ["remote", "add", remote, target.ssh_url], dry_run=dry_run)
+        step(f"Add Gitee remote {remote}: {preferred_url}")
+        run_git(repo, ["remote", "add", remote, preferred_url], dry_run=dry_run)
+        return
+
+    existing = existing_url.strip()
+    if existing == preferred_url:
+        log(f"Gitee remote {remote} already points to {existing_url}")
+        return
+
+    if existing in {target.ssh_url, target.https_url}:
+        message = (
+            f"Gitee remote {remote!r} points to {existing_url!r}; "
+            f"preferred usable URL is {preferred_url!r}."
+        )
+        if not fix_remote and not auto_fix_remote:
+            raise SyncError(message + " Re-run with --fix-remote to update it.")
+        if auto_fix_remote and not fix_remote:
+            log(f"[WARN] {message} 三方同步会自动切换到可用协议。")
+        step(f"Update Gitee remote {remote}: {preferred_url}")
+        run_git(repo, ["remote", "set-url", remote, preferred_url], dry_run=dry_run)
         return
 
     if remote_matches_target(existing_url, target):
-        log(f"Gitee remote {remote} already points to {existing_url}")
+        log(f"Gitee remote {remote} already points to the target repository: {existing_url}")
         return
 
     message = (
         f"Gitee remote {remote!r} points to {existing_url!r}, "
-        f"expected {target.ssh_url!r}."
+        f"expected {target.ssh_url!r} or {target.https_url!r}."
     )
-    if not fix_remote:
+    if not fix_remote and not auto_fix_remote:
         raise SyncError(message + " Re-run with --fix-remote to update it.")
 
-    step(f"Update Gitee remote {remote}: {target.ssh_url}")
-    run_git(repo, ["remote", "set-url", remote, target.ssh_url], dry_run=dry_run)
+    if auto_fix_remote and not fix_remote:
+        log(f"[WARN] {message} 三方同步会自动改成 GitHub 同名的 Gitee 目标。")
+    step(f"Update Gitee remote {remote}: {preferred_url}")
+    run_git(repo, ["remote", "set-url", remote, preferred_url], dry_run=dry_run)
+
+def ensure_github_repository(
+    *,
+    repo: Path,
+    github_remote: str,
+    github_owner: str | None,
+    github_repo: str | None,
+    github_private: bool,
+    fix_remote: bool,
+    confirm_remote_retarget: bool,
+    dry_run: bool,
+) -> RepoSlug:
+    repo = ensure_repo(repo)
+    log(f"Repository: {repo}")
+    log(f"GitHub remote: {github_remote}")
+
+    # 只补齐 GitHub，不检查 Gitee，也不要求工作区干净，方便先把仓库入口建好。
+    slug = ensure_github_remote(
+        repo=repo,
+        remote=github_remote,
+        github_owner=github_owner,
+        github_repo=github_repo,
+        github_private=github_private,
+        fix_remote=fix_remote,
+        confirm_remote_retarget=confirm_remote_retarget,
+        dry_run=dry_run,
+    )
+    log(f"GitHub ready: {slug.owner}/{slug.name}")
+    return slug
 
 
 def api_quote(value: str) -> str:
@@ -718,13 +1117,7 @@ def gitee_api_request(
         url = f"{url}?{urllib.parse.urlencode(query)}"
 
     request = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return read_json_response(response)
-    except urllib.error.HTTPError as exc:
-        return read_json_response(exc)
-    except urllib.error.URLError as exc:
-        raise SyncError(f"Gitee API request failed: {exc}") from exc
+    return urlopen_json_request("Gitee", request)
 
 
 def gitee_error_message(response: ApiResponse) -> str:
@@ -734,6 +1127,11 @@ def gitee_error_message(response: ApiResponse) -> str:
             if value:
                 return str(value)
     return response.text.strip() or f"HTTP {response.status}"
+
+
+def is_empty_gitee_repo_public_error(response: ApiResponse) -> bool:
+    message = gitee_error_message(response)
+    return response.status == 422 and "空仓库不支持设置为公开仓库" in message
 
 
 def get_gitee_repo(target: GiteeTarget, token: str | None) -> ApiResponse:
@@ -782,12 +1180,45 @@ def ensure_gitee_repo_visibility(
         )
 
 
+def make_gitee_repo_public_if_needed(
+    target: GiteeTarget,
+    response: ApiResponse,
+    *,
+    token: str | None,
+    private: bool,
+) -> tuple[ApiResponse, bool]:
+    if private or not is_gitee_repo_private(response):
+        return response, False
+
+    if not token:
+        raise SyncError(
+            f"Gitee repository already exists but is private: {target.web_url}. "
+            f"Set {GITEE_TOKEN_ENV} so the script can make it public, "
+            "or make it public on Gitee manually."
+        )
+
+    step(f"Make Gitee repository public: {target.web_url}")
+    if not update_gitee_repo_visibility(
+        target,
+        token=token,
+        private=False,
+        allow_empty_repo=True,
+    ):
+        log(
+            "[WARN] Gitee does not allow making an empty repository public yet; "
+            "will retry after pushing code."
+        )
+        return response, True
+    return get_gitee_repo(target, token), False
+
+
 def update_gitee_repo_visibility(
     target: GiteeTarget,
     *,
     token: str,
     private: bool,
-) -> None:
+    allow_empty_repo: bool = False,
+) -> bool:
     # Gitee 使用 PATCH 仓库接口更新公开/私有状态，private=false 表示公开仓库。
     response = gitee_api_request(
         "PATCH",
@@ -799,10 +1230,13 @@ def update_gitee_repo_visibility(
         },
     )
     if response.status not in (200, 201, 204):
+        if not private and allow_empty_repo and is_empty_gitee_repo_public_error(response):
+            return False
         raise SyncError(
             f"Could not update Gitee repository visibility {target.web_url}: "
             f"HTTP {response.status}: {gitee_error_message(response)}"
         )
+    return True
 
 
 def gitee_default_branch(response: ApiResponse) -> str | None:
@@ -820,7 +1254,7 @@ def update_gitee_default_branch(
     token: str,
     branch: str,
 ) -> None:
-    # Gitee 网页默认展示 default_branch；同步 main 后也要把默认分支切到 main。
+    # Gitee 网页默认展示 default_branch；同步后也要把默认分支切到当前同步分支。
     response = gitee_api_request(
         "PATCH",
         f"/repos/{api_quote(target.owner)}/{api_quote(target.name)}",
@@ -901,28 +1335,25 @@ def ensure_gitee_repo(
     token: str | None,
     private: bool,
     dry_run: bool,
-) -> None:
+) -> bool:
     visibility = "private" if private else "public"
     if dry_run:
         step(f"Would check or create {visibility} Gitee repository: {target.web_url}")
-        return
+        return False
 
     step(f"Check Gitee repository: {target.web_url}")
     response = get_gitee_repo(target, token)
     if response.status == 200:
-        if not private and is_gitee_repo_private(response):
-            if not token:
-                raise SyncError(
-                    f"Gitee repository already exists but is private: {target.web_url}. "
-                    f"Set {GITEE_TOKEN_ENV} so the script can make it public, "
-                    "or make it public on Gitee manually."
-                )
-            step(f"Make existing Gitee repository public: {target.web_url}")
-            update_gitee_repo_visibility(target, token=token, private=False)
-            response = get_gitee_repo(target, token)
-        ensure_gitee_repo_visibility(target, response, private=private)
+        response, retry_public_after_push = make_gitee_repo_public_if_needed(
+            target,
+            response,
+            token=token,
+            private=private,
+        )
+        if not retry_public_after_push:
+            ensure_gitee_repo_visibility(target, response, private=private)
         log(f"Gitee repository exists: {target.web_url}")
-        return
+        return retry_public_after_push
     if response.status != 404:
         raise SyncError(
             f"Could not check Gitee repository {target.web_url}: "
@@ -943,8 +1374,16 @@ def ensure_gitee_repo(
             "Gitee repository was created, but the expected target path was not found. "
             "Check whether --gitee-owner matches your Gitee account namespace."
         )
-    ensure_gitee_repo_visibility(target, response, private=private)
+    response, retry_public_after_push = make_gitee_repo_public_if_needed(
+        target,
+        response,
+        token=token,
+        private=private,
+    )
+    if not retry_public_after_push:
+        ensure_gitee_repo_visibility(target, response, private=private)
     log(f"Gitee repository created: {target.web_url}")
+    return retry_public_after_push
 
 
 def remote_ref(remote: str, branch: str) -> str:
@@ -974,7 +1413,7 @@ def print_final_refs(repo: Path, branch: str, github_remote: str, gitee_remote: 
 def sync_repositories(
     *,
     repo: Path,
-    branch: str,
+    branch: str | None,
     github_remote: str,
     gitee_remote: str,
     github_owner: str | None,
@@ -983,9 +1422,12 @@ def sync_repositories(
     gitee_owner: str | None,
     private: bool,
     fix_remote: bool,
+    confirm_github_remote_retarget: bool,
     dry_run: bool,
 ) -> None:
     repo = ensure_repo(repo)
+    if branch is None:
+        branch = current_branch(repo)
     log(f"Repository: {repo}")
     log(f"Branch: {branch}")
     log(f"GitHub remote: {github_remote}")
@@ -1005,24 +1447,34 @@ def sync_repositories(
         github_repo=github_repo,
         github_private=github_private,
         fix_remote=fix_remote,
+        confirm_remote_retarget=confirm_github_remote_retarget,
         dry_run=dry_run,
     )
-    # 2. Gitee owner 默认取 SSH 登录账号，例如 liangliang2000；仓库名沿用 GitHub 仓库名。
+    # 2. Gitee owner 默认取命令行参数；没有参数时优先 SSH/token 识别，最后回退到 DEFAULT_GITEE_OWNER。
+    token, token_source = gitee_token()
+    if token:
+        log(f"Using Gitee token from {token_source}.")
+
     target = build_gitee_target(
-        choose_gitee_owner(gitee_owner, github_slug.owner),
+        choose_gitee_owner(gitee_owner, github_slug.owner, token),
         github_slug.name,
     )
     log(f"GitHub repository: {github_slug.owner}/{github_slug.name}")
     log(f"Gitee target: {target.owner}/{target.name}")
 
     # 3. 确保 Gitee 仓库存在。默认创建公开仓库；只有传 --private 才创建/允许私有仓库。
-    token = os.environ.get(GITEE_TOKEN_ENV)
-    ensure_gitee_repo(target=target, token=token, private=private, dry_run=dry_run)
+    gitee_public_after_push = ensure_gitee_repo(
+        target=target,
+        token=token,
+        private=private,
+        dry_run=dry_run,
+    )
     ensure_gitee_remote(
         repo=repo,
         remote=gitee_remote,
         target=target,
         fix_remote=fix_remote,
+        auto_fix_remote=True,
         dry_run=dry_run,
     )
 
@@ -1041,7 +1493,7 @@ def sync_repositories(
     missing_refs: list[str] = []
     fetched_remotes: list[str] = []
     for remote in (github_remote, gitee_remote):
-        # 4. 拉取两端远程分支。新仓库还没有 main 分支时，只记录 warning。
+        # 4. 拉取两端远程分支。新仓库还没有该分支时，只记录 warning。
         step(f"Fetch {remote}/{branch}")
         result = run_git(repo, ["fetch", remote, branch], check=False)
         if result.returncode == 0:
@@ -1054,6 +1506,8 @@ def sync_repositories(
 
     if not fetched_remotes and fetch_warnings:
         raise SyncError("Both GitHub and Gitee fetch operations failed.")
+
+    ensure_complete_history(repo, github_remote, dry_run=dry_run)
 
     try:
         for remote in fetched_remotes:
@@ -1084,6 +1538,42 @@ def sync_repositories(
         if result.returncode != 0:
             fetch_warnings.append(f"refresh {remote}: exit code {result.returncode}")
 
+    gitee_push_failed = any(
+        failure.startswith(f"push {gitee_remote}:") for failure in push_failures
+    )
+    if push_failures:
+        if gitee_public_after_push and gitee_push_failed:
+            log(
+                "[WARN] Skipping public visibility retry because the Gitee push failed. "
+                "Fix the push failure and re-run."
+            )
+        for warning in fetch_warnings:
+            log(f"[WARN] {warning}")
+        for failure in push_failures:
+            log(f"[ERROR] {failure}")
+        raise SyncError("At least one push failed. Re-run after fixing remote access.")
+
+    if gitee_public_after_push and not gitee_push_failed:
+        step("Retry making Gitee repository public after initial push")
+        response = get_gitee_repo(target, token)
+        if response.status != 200:
+            raise SyncError(
+                f"Could not read Gitee repository visibility {target.web_url}: "
+                f"HTTP {response.status}: {gitee_error_message(response)}"
+            )
+        response, still_empty = make_gitee_repo_public_if_needed(
+            target,
+            response,
+            token=token,
+            private=private,
+        )
+        if still_empty:
+            raise SyncError(
+                "Gitee still reports the repository as empty after push. "
+                "Check whether the Gitee push created the target branch, then re-run."
+            )
+        ensure_gitee_repo_visibility(target, response, private=private)
+
     ensure_gitee_default_branch(
         target=target,
         branch=branch,
@@ -1096,10 +1586,6 @@ def sync_repositories(
         log(f"[WARN] Initialized missing remote branch during push: {missing_ref}")
     for warning in fetch_warnings:
         log(f"[WARN] {warning}")
-    if push_failures:
-        for failure in push_failures:
-            log(f"[ERROR] {failure}")
-        raise SyncError("At least one push failed. Re-run after fixing remote access.")
     log("Sync complete: local, GitHub, and Gitee are aligned.")
 
 
@@ -1140,13 +1626,15 @@ def print_init_gitee(
         print("  gitee.com is not present in ~/.ssh/known_hosts yet")
 
     print("\nGitHub access token:")
-    github_token, github_token_name = env_token(GITHUB_TOKEN_ENV_NAMES)
-    if github_token:
-        print(f"  {github_token_name} is set")
+    token, token_source = github_token()
+    if token:
+        print(f"  {token_source} is available")
     else:
-        print("  GITHUB_TOKEN or GH_TOKEN is not set")
+        print("  GITHUB_TOKEN or GH_TOKEN is not set, and gh auth token is unavailable")
         print("  Current PowerShell session:")
         print("    $env:GITHUB_TOKEN='your-github-token'")
+        print("  Or login with GitHub CLI:")
+        print("    gh auth login")
         print("  Persist for your Windows user:")
         print(
             "    [Environment]::SetEnvironmentVariable("
@@ -1154,8 +1642,9 @@ def print_init_gitee(
         )
 
     print("\nGitee access token:")
-    if os.environ.get(GITEE_TOKEN_ENV):
-        print(f"  {GITEE_TOKEN_ENV} is set")
+    gitee_access_token, gitee_token_source = gitee_token()
+    if gitee_access_token:
+        print(f"  {gitee_token_source} is available")
     else:
         print(f"  {GITEE_TOKEN_ENV} is not set")
         print("  Current PowerShell session:")
@@ -1185,16 +1674,50 @@ def print_init_gitee(
         if slug:
             github_target = build_github_target(slug.owner, slug.name)
             target = build_gitee_target(
-                choose_gitee_owner(gitee_owner, slug.owner),
+                choose_gitee_owner(gitee_owner, slug.owner, gitee_access_token),
                 slug.name,
             )
             print("\nDerived repository mapping:")
             print(f"  GitHub: {github_target.owner}/{github_target.name}")
             print(f"  GitHub remote: {github_target.ssh_url}")
             print(f"  Gitee : {target.owner}/{target.name}")
-            print(f"  Gitee remote : {target.ssh_url}")
+            print(f"  Gitee SSH remote  : {target.ssh_url}")
+            print(f"  Gitee HTTPS remote: {target.https_url}")
     except SyncError as exc:
         print(f"\nRepository mapping skipped: {exc}")
+
+
+def prompt_main_menu() -> str:
+    print("\n请选择要执行的功能：")
+    print("  1. 创建/补齐 GitHub 公开仓库")
+    print("  2. 三方同步本地、GitHub、Gitee")
+    print("  0. 退出")
+
+    while True:
+        try:
+            choice = input("请输入功能编号：").strip()
+        except EOFError as exc:
+            raise SyncError(
+                "没有读取到菜单选择。非交互运行时请使用 --ensure-github 或 --sync。"
+            ) from exc
+
+        if choice == "1":
+            return MODE_ENSURE_GITHUB
+        if choice == "2":
+            return MODE_SYNC
+        if choice == "0":
+            return MODE_EXIT
+        print("输入无效，请输入 1、2 或 0。")
+
+
+def resolve_run_mode(args: argparse.Namespace) -> str:
+    if args.ensure_github and args.sync:
+        raise SyncError("--ensure-github 和 --sync 只能选择一个。")
+    if args.ensure_github:
+        return MODE_ENSURE_GITHUB
+    if args.sync:
+        return MODE_SYNC
+    return prompt_main_menu()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1209,7 +1732,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--branch",
         default=DEFAULT_BRANCH,
-        help=f"Branch to synchronize. Defaults to {DEFAULT_BRANCH}.",
+        help="Branch to synchronize. Defaults to the current branch.",
     )
     parser.add_argument(
         "--github-remote",
@@ -1218,7 +1741,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--github-owner",
-        default=DEFAULT_GITHUB_OWNER,
+        default=None,
         help=f"GitHub user or organization. Defaults to {DEFAULT_GITHUB_OWNER}.",
     )
     parser.add_argument(
@@ -1241,7 +1764,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Gitee user or namespace. Defaults to the detected Gitee SSH "
-            "login, then falls back to the GitHub owner."
+            f"login, then Gitee token, then {DEFAULT_GITEE_OWNER}."
         ),
     )
     parser.add_argument(
@@ -1258,6 +1781,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Print actions and git commands without changing repositories.",
+    )
+    parser.add_argument(
+        "--ensure-github",
+        action="store_true",
+        help="Only create/check the GitHub repository and origin remote, then exit.",
+    )
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        help="Run the GitHub/Gitee sync directly without showing the menu.",
     )
     parser.add_argument(
         "--init-gitee",
@@ -1280,19 +1813,40 @@ def main(argv: list[str] | None = None) -> int:
                 args.gitee_owner,
             )
             return 0
-        sync_repositories(
-            repo=repo,
-            branch=str(args.branch),
-            github_remote=str(args.github_remote),
-            gitee_remote=str(args.gitee_remote),
-            github_owner=args.github_owner,
-            github_repo=args.github_repo,
-            github_private=bool(args.github_private),
-            gitee_owner=args.gitee_owner,
-            private=bool(args.private),
-            fix_remote=bool(args.fix_remote),
-            dry_run=bool(args.dry_run),
-        )
+        selected_from_menu = not args.ensure_github and not args.sync
+        mode = resolve_run_mode(args)
+        if mode == MODE_EXIT:
+            log("Exit.")
+            return 0
+        if mode == MODE_ENSURE_GITHUB:
+            ensure_github_repository(
+                repo=repo,
+                github_remote=str(args.github_remote),
+                github_owner=args.github_owner,
+                github_repo=args.github_repo,
+                github_private=bool(args.github_private),
+                fix_remote=bool(args.fix_remote),
+                confirm_remote_retarget=selected_from_menu,
+                dry_run=bool(args.dry_run),
+            )
+            return 0
+        if mode == MODE_SYNC:
+            sync_repositories(
+                repo=repo,
+                branch=args.branch,
+                github_remote=str(args.github_remote),
+                gitee_remote=str(args.gitee_remote),
+                github_owner=args.github_owner,
+                github_repo=args.github_repo,
+                github_private=bool(args.github_private),
+                gitee_owner=args.gitee_owner,
+                private=bool(args.private),
+                fix_remote=bool(args.fix_remote),
+                confirm_github_remote_retarget=selected_from_menu,
+                dry_run=bool(args.dry_run),
+            )
+            return 0
+        raise SyncError(f"Unknown run mode: {mode}")
     except SyncError as exc:
         log(f"[ERROR] {exc}")
         return 1
